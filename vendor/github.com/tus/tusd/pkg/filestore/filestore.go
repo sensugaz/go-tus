@@ -49,9 +49,10 @@ func (store FileStore) UseIn(composer *handler.StoreComposer) {
 }
 
 func (store FileStore) NewUpload(ctx context.Context, info handler.FileInfo) (handler.Upload, error) {
-	id := uid.Uid()
-	binPath := store.binPath(id)
-	info.ID = id
+	if info.ID == "" {
+		info.ID = uid.Uid()
+	}
+	binPath := store.binPath(info.ID)
 	info.Storage = map[string]string{
 		"Type": "filestore",
 		"Path": binPath,
@@ -72,8 +73,8 @@ func (store FileStore) NewUpload(ctx context.Context, info handler.FileInfo) (ha
 
 	upload := &fileUpload{
 		info:     info,
-		infoPath: store.infoPath(id),
-		binPath:  store.binPath(id),
+		infoPath: store.infoPath(info.ID),
+		binPath:  binPath,
 	}
 
 	// writeInfo creates the file by itself if necessary
@@ -89,6 +90,10 @@ func (store FileStore) GetUpload(ctx context.Context, id string) (handler.Upload
 	info := handler.FileInfo{}
 	data, err := ioutil.ReadFile(store.infoPath(id))
 	if err != nil {
+		if os.IsNotExist(err) {
+			// Interpret os.ErrNotExist as 404 Not Found
+			err = handler.ErrNotFound
+		}
 		return nil, err
 	}
 	if err := json.Unmarshal(data, &info); err != nil {
@@ -99,6 +104,10 @@ func (store FileStore) GetUpload(ctx context.Context, id string) (handler.Upload
 	infoPath := store.infoPath(id)
 	stat, err := os.Stat(binPath)
 	if err != nil {
+		if os.IsNotExist(err) {
+			// Interpret os.ErrNotExist as 404 Not Found
+			err = handler.ErrNotFound
+		}
 		return nil, err
 	}
 
@@ -155,16 +164,7 @@ func (upload *fileUpload) WriteChunk(ctx context.Context, offset int64, src io.R
 
 	n, err := io.Copy(file, src)
 
-	// If the HTTP PATCH request gets interrupted in the middle (e.g. because
-	// the user wants to pause the upload), Go's net/http returns an io.ErrUnexpectedEOF.
-	// However, for FileStore it's not important whether the stream has ended
-	// on purpose or accidentally.
-	if err == io.ErrUnexpectedEOF {
-		err = nil
-	}
-
 	upload.info.Offset += n
-
 	return n, err
 }
 

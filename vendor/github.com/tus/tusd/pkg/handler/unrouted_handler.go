@@ -7,21 +7,21 @@ import (
 	"io"
 	"log"
 	"math"
+	"mime"
 	"net"
 	"net/http"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 )
 
 const UploadLengthDeferred = "1"
+const currentUploadDraftInteropVersion = "3"
 
 var (
 	reExtractFileID  = regexp.MustCompile(`([^/]+)\/?$`)
-	reForwardedHost  = regexp.MustCompile(`host=([^,]+)`)
+	reForwardedHost  = regexp.MustCompile(`host="?([^;"]+)`)
 	reForwardedProto = regexp.MustCompile(`proto=(https?)`)
 	reMimeType       = regexp.MustCompile(`^[a-z]+\/[a-z0-9\-\+\.]+$`)
 )
@@ -72,6 +72,10 @@ var (
 	ErrUploadLengthAndUploadDeferLength = NewHTTPError(errors.New("provided both Upload-Length and Upload-Defer-Length"), http.StatusBadRequest)
 	ErrInvalidUploadDeferLength         = NewHTTPError(errors.New("invalid Upload-Defer-Length header"), http.StatusBadRequest)
 	ErrUploadStoppedByServer            = NewHTTPError(errors.New("upload has been stopped by server"), http.StatusBadRequest)
+	ErrOriginNotAllowed                 = NewHTTPError(errors.New("request origin is not allowed"), http.StatusForbidden)
+
+	errReadTimeout     = errors.New("read tcp: i/o timeout")
+	errConnectionReset = errors.New("read tcp: connection reset by peer")
 )
 
 // HTTPRequest contains basic details of an incoming HTTP request.
@@ -97,6 +101,12 @@ type HookEvent struct {
 }
 
 func newHookEvent(info FileInfo, r *http.Request) HookEvent {
+	// The Host header field is not present in the header map, see https://pkg.go.dev/net/http#Request:
+	// > For incoming requests, the Host header is promoted to the
+	// > Request.Host field and removed from the Header map.
+	// That's why we add it back manually.
+	r.Header.Set("Host", r.Host)
+
 	return HookEvent{
 		Upload: info,
 		HTTPRequest: HTTPRequest{
@@ -204,35 +214,51 @@ func (handler *UnroutedHandler) SupportedExtensions() string {
 func (handler *UnroutedHandler) Middleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Allow overriding the HTTP method. The reason for this is
-		// that some libraries/environments to not support PATCH and
-		// DELETE requests, e.g. Flash in a browser and parts of Java
-		if newMethod := r.Header.Get("X-HTTP-Method-Override"); newMethod != "" {
+		// that some libraries/environments do not support PATCH and
+		// DELETE requests, e.g. Flash in a browser and parts of Java.
+		if newMethod := r.Header.Get("X-HTTP-Method-Override"); r.Method == "POST" && newMethod != "" {
 			r.Method = newMethod
 		}
 
-		handler.log("RequestIncoming", "method", r.Method, "path", r.URL.Path)
+		handler.log("RequestIncoming", "method", r.Method, "path", r.URL.Path, "requestId", getRequestId(r))
 
 		handler.Metrics.incRequestsTotal(r.Method)
 
 		header := w.Header()
 
-		if origin := r.Header.Get("Origin"); origin != "" {
+		cors := handler.config.Cors
+		if origin := r.Header.Get("Origin"); !cors.Disable && origin != "" {
+			originIsAllowed := cors.AllowOrigin.MatchString(origin)
+			if !originIsAllowed {
+				handler.sendError(w, r, ErrOriginNotAllowed)
+				return
+			}
+
 			header.Set("Access-Control-Allow-Origin", origin)
+			header.Set("Vary", "Origin")
+
+			if cors.AllowCredentials {
+				header.Add("Access-Control-Allow-Credentials", "true")
+			}
 
 			if r.Method == "OPTIONS" {
 				// Preflight request
-				header.Add("Access-Control-Allow-Methods", "POST, GET, HEAD, PATCH, DELETE, OPTIONS")
-				header.Add("Access-Control-Allow-Headers", "Origin, X-Requested-With, X-HTTP-Method-Override, Content-Type, Upload-Length, Upload-Offset, Tus-Resumable, Upload-Metadata, Upload-Defer-Length, Upload-Concat")
-				header.Set("Access-Control-Max-Age", "86400")
-
+				header.Add("Access-Control-Allow-Methods", cors.AllowMethods)
+				header.Add("Access-Control-Allow-Headers", cors.AllowHeaders)
+				header.Set("Access-Control-Max-Age", cors.MaxAge)
 			} else {
 				// Actual request
-				header.Add("Access-Control-Expose-Headers", "Upload-Offset, Location, Upload-Length, Tus-Version, Tus-Resumable, Tus-Max-Size, Tus-Extension, Upload-Metadata, Upload-Defer-Length, Upload-Concat")
+				header.Add("Access-Control-Expose-Headers", cors.ExposeHeaders)
 			}
 		}
 
-		// Set current version used by the server
-		header.Set("Tus-Resumable", "1.0.0")
+		// Detect requests with tus v1 protocol vs the IETF resumable upload draft
+		isTusV1 := !handler.isResumableUploadDraftRequest(r)
+
+		if isTusV1 {
+			// Set current version used by the server
+			header.Set("Tus-Resumable", "1.0.0")
+		}
 
 		// Add nosniff to all responses https://golang.org/src/net/http/server.go#L1429
 		header.Set("X-Content-Type-Options", "nosniff")
@@ -259,9 +285,9 @@ func (handler *UnroutedHandler) Middleware(h http.Handler) http.Handler {
 		}
 
 		// Test if the version sent by the client is supported
-		// GET methods are not checked since a browser may visit this URL and does
-		// not include this header. This request is not part of the specification.
-		if r.Method != "GET" && r.Header.Get("Tus-Resumable") != "1.0.0" {
+		// GET and HEAD methods are not checked since a browser may visit this URL and does
+		// not include this header. GET requests are not part of the specification.
+		if r.Method != "GET" && r.Method != "HEAD" && r.Header.Get("Tus-Resumable") != "1.0.0" && isTusV1 {
 			handler.sendError(w, r, ErrUnsupportedVersion)
 			return
 		}
@@ -274,6 +300,11 @@ func (handler *UnroutedHandler) Middleware(h http.Handler) http.Handler {
 // PostFile creates a new file upload using the datastore after validating the
 // length and parsing the metadata.
 func (handler *UnroutedHandler) PostFile(w http.ResponseWriter, r *http.Request) {
+	if handler.isResumableUploadDraftRequest(r) {
+		handler.PostFileV2(w, r)
+		return
+	}
+
 	ctx := context.Background()
 
 	// Check for presence of application/offset+octet-stream. If another content
@@ -415,6 +446,140 @@ func (handler *UnroutedHandler) PostFile(w http.ResponseWriter, r *http.Request)
 	handler.sendResp(w, r, http.StatusCreated)
 }
 
+// PostFile creates a new file upload using the datastore after validating the
+// length and parsing the metadata.
+func (handler *UnroutedHandler) PostFileV2(w http.ResponseWriter, r *http.Request) {
+	ctx := context.Background()
+
+	// Parse headers
+	contentType := r.Header.Get("Content-Type")
+	contentDisposition := r.Header.Get("Content-Disposition")
+	isComplete := r.Header.Get("Upload-Incomplete") == "?0"
+
+	info := FileInfo{
+		MetaData: make(MetaData),
+	}
+	if isComplete && r.ContentLength != -1 {
+		// If the client wants to perform the upload in one request with Content-Length, we know the final upload size.
+		info.Size = r.ContentLength
+	} else {
+		// Error out if the storage does not support upload length deferring, but we need it.
+		if !handler.composer.UsesLengthDeferrer {
+			handler.sendError(w, r, ErrNotImplemented)
+			return
+		}
+
+		info.SizeIsDeferred = true
+	}
+
+	// Parse Content-Type and Content-Disposition to get file type or file name
+	if contentType != "" {
+		fileType, _, err := mime.ParseMediaType(contentType)
+		if err != nil {
+			handler.sendError(w, r, err)
+			return
+		}
+
+		info.MetaData["filetype"] = fileType
+	}
+
+	if contentDisposition != "" {
+		_, values, err := mime.ParseMediaType(contentDisposition)
+		if err != nil {
+			handler.sendError(w, r, err)
+			return
+		}
+
+		if values["filename"] != "" {
+			info.MetaData["filename"] = values["filename"]
+		}
+	}
+
+	// 1. Create upload resource
+	if handler.config.PreUploadCreateCallback != nil {
+		if err := handler.config.PreUploadCreateCallback(newHookEvent(info, r)); err != nil {
+			handler.sendError(w, r, err)
+			return
+		}
+	}
+
+	upload, err := handler.composer.Core.NewUpload(ctx, info)
+	if err != nil {
+		handler.sendError(w, r, err)
+		return
+	}
+
+	info, err = upload.GetInfo(ctx)
+	if err != nil {
+		handler.sendError(w, r, err)
+		return
+	}
+
+	id := info.ID
+
+	// Add the Location header directly after creating the new resource to even
+	// include it in cases of failure when an error is returned
+	url := handler.absFileURL(r, id)
+	w.Header().Set("Location", url)
+
+	// Send 104 response
+	w.Header().Set("Upload-Draft-Interop-Version", currentUploadDraftInteropVersion)
+	w.WriteHeader(104)
+
+	handler.Metrics.incUploadsCreated()
+
+	handler.log("UploadCreated", "id", id, "size", i64toa(info.Size), "url", url)
+
+	if handler.config.NotifyCreatedUploads {
+		handler.CreatedUploads <- newHookEvent(info, r)
+	}
+
+	// 2. Lock upload
+	if handler.composer.UsesLocker {
+		lock, err := handler.lockUpload(id)
+		if err != nil {
+			handler.sendError(w, r, err)
+			return
+		}
+
+		defer lock.Unlock()
+	}
+
+	// 3. Write chunk
+	if err := handler.writeChunk(ctx, upload, info, w, r); err != nil {
+		handler.sendError(w, r, err)
+		return
+	}
+
+	// 4. Finish upload, if necessary
+	if isComplete && info.SizeIsDeferred {
+		info, err = upload.GetInfo(ctx)
+		if err != nil {
+			handler.sendError(w, r, err)
+			return
+		}
+
+		uploadLength := info.Offset
+
+		lengthDeclarableUpload := handler.composer.LengthDeferrer.AsLengthDeclarableUpload(upload)
+		if err := lengthDeclarableUpload.DeclareLength(ctx, uploadLength); err != nil {
+			handler.sendError(w, r, err)
+			return
+		}
+
+		info.Size = uploadLength
+		info.SizeIsDeferred = false
+
+		if err := handler.finishUploadIfComplete(ctx, upload, info, r); err != nil {
+			handler.sendError(w, r, err)
+			return
+		}
+
+	}
+
+	handler.sendResp(w, r, http.StatusCreated)
+}
+
 // HeadFile returns the length and offset for the HEAD request
 func (handler *UnroutedHandler) HeadFile(w http.ResponseWriter, r *http.Request) {
 	ctx := context.Background()
@@ -447,35 +612,52 @@ func (handler *UnroutedHandler) HeadFile(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Add Upload-Concat header if possible
-	if info.IsPartial {
-		w.Header().Set("Upload-Concat", "partial")
-	}
-
-	if info.IsFinal {
-		v := "final;"
-		for _, uploadID := range info.PartialUploads {
-			v += handler.absFileURL(r, uploadID) + " "
-		}
-		// Remove trailing space
-		v = v[:len(v)-1]
-
-		w.Header().Set("Upload-Concat", v)
-	}
-
-	if len(info.MetaData) != 0 {
-		w.Header().Set("Upload-Metadata", SerializeMetadataHeader(info.MetaData))
-	}
-
-	if info.SizeIsDeferred {
-		w.Header().Set("Upload-Defer-Length", UploadLengthDeferred)
-	} else {
-		w.Header().Set("Upload-Length", strconv.FormatInt(info.Size, 10))
-	}
-
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Upload-Offset", strconv.FormatInt(info.Offset, 10))
-	handler.sendResp(w, r, http.StatusOK)
+
+	if !handler.isResumableUploadDraftRequest(r) {
+		// Add Upload-Concat header if possible
+		if info.IsPartial {
+			w.Header().Set("Upload-Concat", "partial")
+		}
+
+		if info.IsFinal {
+			v := "final;"
+			for _, uploadID := range info.PartialUploads {
+				v += handler.absFileURL(r, uploadID) + " "
+			}
+			// Remove trailing space
+			v = v[:len(v)-1]
+
+			w.Header().Set("Upload-Concat", v)
+		}
+
+		if len(info.MetaData) != 0 {
+			w.Header().Set("Upload-Metadata", SerializeMetadataHeader(info.MetaData))
+		}
+
+		if info.SizeIsDeferred {
+			w.Header().Set("Upload-Defer-Length", UploadLengthDeferred)
+		} else {
+			w.Header().Set("Upload-Length", strconv.FormatInt(info.Size, 10))
+			w.Header().Set("Content-Length", strconv.FormatInt(info.Size, 10))
+		}
+
+		// TODO: We send a 200 OK here by default. Can we switch this to 204?
+		handler.sendResp(w, r, http.StatusOK)
+	} else {
+		if !info.SizeIsDeferred && info.Offset == info.Size {
+			// Upload is complete if we know the size and it matches the offset.
+			w.Header().Set("Upload-Incomplete", "?0")
+		} else {
+			w.Header().Set("Upload-Incomplete", "?1")
+		}
+
+		w.Header().Set("Upload-Draft-Interop-Version", currentUploadDraftInteropVersion)
+
+		// Draft requires a 204 No Content response
+		handler.sendResp(w, r, http.StatusNoContent)
+	}
 }
 
 // PatchFile adds a chunk to an upload. This operation is only allowed
@@ -483,8 +665,10 @@ func (handler *UnroutedHandler) HeadFile(w http.ResponseWriter, r *http.Request)
 func (handler *UnroutedHandler) PatchFile(w http.ResponseWriter, r *http.Request) {
 	ctx := context.Background()
 
+	isTusV1 := !handler.isResumableUploadDraftRequest(r)
+
 	// Check for presence of application/offset+octet-stream
-	if r.Header.Get("Content-Type") != "application/offset+octet-stream" {
+	if isTusV1 && r.Header.Get("Content-Type") != "application/offset+octet-stream" {
 		handler.sendError(w, r, ErrInvalidContentType)
 		return
 	}
@@ -535,6 +719,10 @@ func (handler *UnroutedHandler) PatchFile(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// TODO: If Upload-Incomplete: ?0 and Content-Length is set, we can
+	// - declare the length already here
+	// - validate that the length from this request matches info.Size if !info.SizeIsDeferred
+
 	// Do not proxy the call to the data store if the upload is already completed
 	if !info.SizeIsDeferred && info.Offset == info.Size {
 		w.Header().Set("Upload-Offset", strconv.FormatInt(offset, 10))
@@ -570,6 +758,32 @@ func (handler *UnroutedHandler) PatchFile(w http.ResponseWriter, r *http.Request
 	if err := handler.writeChunk(ctx, upload, info, w, r); err != nil {
 		handler.sendError(w, r, err)
 		return
+	}
+
+	isComplete := r.Header.Get("Upload-Incomplete") == "?0"
+	if isComplete && info.SizeIsDeferred {
+		info, err = upload.GetInfo(ctx)
+		if err != nil {
+			handler.sendError(w, r, err)
+			return
+		}
+
+		uploadLength := info.Offset
+
+		lengthDeclarableUpload := handler.composer.LengthDeferrer.AsLengthDeclarableUpload(upload)
+		if err := lengthDeclarableUpload.DeclareLength(ctx, uploadLength); err != nil {
+			handler.sendError(w, r, err)
+			return
+		}
+
+		info.Size = uploadLength
+		info.SizeIsDeferred = false
+
+		if err := handler.finishUploadIfComplete(ctx, upload, info, r); err != nil {
+			handler.sendError(w, r, err)
+			return
+		}
+
 	}
 
 	handler.sendResp(w, r, http.StatusNoContent)
@@ -609,11 +823,12 @@ func (handler *UnroutedHandler) writeChunk(ctx context.Context, upload Upload, i
 	handler.log("ChunkWriteStart", "id", id, "maxSize", i64toa(maxSize), "offset", i64toa(offset))
 
 	var bytesWritten int64
+	var err error
 	// Prevent a nil pointer dereference when accessing the body which may not be
 	// available in the case of a malicious request.
 	if r.Body != nil {
 		// Limit the data read from the request's body to the allowed maximum
-		reader := io.LimitReader(r.Body, maxSize)
+		reader := newBodyReader(io.LimitReader(r.Body, maxSize))
 
 		// We use a context object to allow the hook system to cancel an upload
 		uploadCtx, stopUpload := context.WithCancel(context.Background())
@@ -633,12 +848,10 @@ func (handler *UnroutedHandler) writeChunk(ctx context.Context, upload Upload, i
 		}()
 
 		if handler.config.NotifyUploadProgress {
-			var stopProgressEvents chan<- struct{}
-			reader, stopProgressEvents = handler.sendProgressMessages(newHookEvent(info, r), reader)
+			stopProgressEvents := handler.sendProgressMessages(newHookEvent(info, r), reader)
 			defer close(stopProgressEvents)
 		}
 
-		var err error
 		bytesWritten, err = upload.WriteChunk(ctx, offset, reader)
 		if terminateUpload && handler.composer.UsesTerminater {
 			if terminateErr := handler.terminateUpload(ctx, upload, info, r); terminateErr != nil {
@@ -648,19 +861,27 @@ func (handler *UnroutedHandler) writeChunk(ctx context.Context, upload Upload, i
 			}
 		}
 
-		// The error "http: invalid Read on closed Body" is returned if we stop the upload
-		// while the data store is still reading. Since this is an implementation detail,
-		// we replace this error with a message saying that the upload has been stopped.
-		if err == http.ErrBodyReadAfterClose {
-			err = ErrUploadStoppedByServer
+		// If we encountered an error while reading the body from the HTTP request, log it, but only include
+		// it in the response, if the store did not also return an error.
+		if bodyErr := reader.hasError(); bodyErr != nil {
+			handler.log("BodyReadError", "id", id, "error", bodyErr.Error())
+			if err == nil {
+				err = bodyErr
+			}
 		}
 
-		if err != nil {
-			return err
+		// If the upload was stopped by the server, send an error response indicating this.
+		// TODO: Include a custom reason for the end user why the upload was stopped.
+		if terminateUpload {
+			err = ErrUploadStoppedByServer
 		}
 	}
 
 	handler.log("ChunkWriteComplete", "id", id, "bytesWritten", i64toa(bytesWritten))
+
+	if err != nil {
+		return err
+	}
 
 	// Send new offset to client
 	newOffset := offset + bytesWritten
@@ -677,17 +898,24 @@ func (handler *UnroutedHandler) writeChunk(ctx context.Context, upload Upload, i
 func (handler *UnroutedHandler) finishUploadIfComplete(ctx context.Context, upload Upload, info FileInfo, r *http.Request) error {
 	// If the upload is completed, ...
 	if !info.SizeIsDeferred && info.Offset == info.Size {
-		// ... allow custom mechanism to finish and cleanup the upload
+		// ... allow the data storage to finish and cleanup the upload
 		if err := upload.FinishUpload(ctx); err != nil {
 			return err
 		}
+
+		// ... allow the hook callback to run before sending the response
+		if handler.config.PreFinishResponseCallback != nil {
+			if err := handler.config.PreFinishResponseCallback(newHookEvent(info, r)); err != nil {
+				return err
+			}
+		}
+
+		handler.Metrics.incUploadsFinished()
 
 		// ... send the info out to the channel
 		if handler.config.NotifyCompleteUploads {
 			handler.CompleteUploads <- newHookEvent(info, r)
 		}
-
-		handler.Metrics.incUploadsFinished()
 	}
 
 	return nil
@@ -756,10 +984,10 @@ func (handler *UnroutedHandler) GetFile(w http.ResponseWriter, r *http.Request) 
 
 // mimeInlineBrowserWhitelist is a map containing MIME types which should be
 // allowed to be rendered by browser inline, instead of being forced to be
-// downloadd. For example, HTML or SVG files are not allowed, since they may
+// downloaded. For example, HTML or SVG files are not allowed, since they may
 // contain malicious JavaScript. In a similiar fashion PDF is not on this list
 // as their parsers commonly contain vulnerabilities which can be exploited.
-// The values of this map does not convei any meaning and are therefore just
+// The values of this map does not convey any meaning and are therefore just
 // empty structs.
 var mimeInlineBrowserWhitelist = map[string]struct{}{
 	"text/plain": struct{}{},
@@ -777,7 +1005,7 @@ var mimeInlineBrowserWhitelist = map[string]struct{}{
 	"audio/webm":      struct{}{},
 	"video/webm":      struct{}{},
 	"audio/ogg":       struct{}{},
-	"video/ogg ":      struct{}{},
+	"video/ogg":       struct{}{},
 	"application/ogg": struct{}{},
 }
 
@@ -890,25 +1118,39 @@ func (handler *UnroutedHandler) terminateUpload(ctx context.Context, upload Uplo
 // Send the error in the response body. The status code will be looked up in
 // ErrStatusCodes. If none is found 500 Internal Error will be used.
 func (handler *UnroutedHandler) sendError(w http.ResponseWriter, r *http.Request, err error) {
-	// Interpret os.ErrNotExist as 404 Not Found
-	if os.IsNotExist(err) {
-		err = ErrNotFound
-	}
-
 	// Errors for read timeouts contain too much information which is not
 	// necessary for us and makes grouping for the metrics harder. The error
 	// message looks like: read tcp 127.0.0.1:1080->127.0.0.1:53673: i/o timeout
 	// Therefore, we use a common error message for all of them.
 	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-		err = errors.New("read tcp: i/o timeout")
+		err = errReadTimeout
 	}
 
 	// Errors for connnection resets also contain TCP details, we don't need, e.g:
 	// read tcp 127.0.0.1:1080->127.0.0.1:10023: read: connection reset by peer
 	// Therefore, we also trim those down.
 	if strings.HasSuffix(err.Error(), "read: connection reset by peer") {
-		err = errors.New("read tcp: connection reset by peer")
+		err = errConnectionReset
 	}
+
+	// TODO: Decide if we should handle this in here, in body_reader or not at all.
+	// If the HTTP PATCH request gets interrupted in the middle (e.g. because
+	// the user wants to pause the upload), Go's net/http returns an io.ErrUnexpectedEOF.
+	// However, for the handler it's not important whether the stream has ended
+	// on purpose or accidentally.
+	//if err == io.ErrUnexpectedEOF {
+	//	err = nil
+	//}
+
+	// TODO: Decide if we want to ignore connection reset errors all together.
+	// In some cases, the HTTP connection gets reset by the other peer. This is not
+	// necessarily the tus client but can also be a proxy in front of tusd, e.g. HAProxy 2
+	// is known to reset the connection to tusd, when the tus client closes the connection.
+	// To avoid erroring out in this case and loosing the uploaded data, we can ignore
+	// the error here without causing harm.
+	//if strings.Contains(err.Error(), "read: connection reset by peer") {
+	//	err = nil
+	//}
 
 	statusErr, ok := err.(HTTPError)
 	if !ok {
@@ -925,7 +1167,7 @@ func (handler *UnroutedHandler) sendError(w http.ResponseWriter, r *http.Request
 	w.WriteHeader(statusErr.StatusCode())
 	w.Write(reason)
 
-	handler.log("ResponseOutgoing", "status", strconv.Itoa(statusErr.StatusCode()), "method", r.Method, "path", r.URL.Path, "error", err.Error())
+	handler.log("ResponseOutgoing", "status", strconv.Itoa(statusErr.StatusCode()), "method", r.Method, "path", r.URL.Path, "error", err.Error(), "requestId", getRequestId(r))
 
 	handler.Metrics.incErrorsTotal(statusErr)
 }
@@ -934,7 +1176,7 @@ func (handler *UnroutedHandler) sendError(w http.ResponseWriter, r *http.Request
 func (handler *UnroutedHandler) sendResp(w http.ResponseWriter, r *http.Request, status int) {
 	w.WriteHeader(status)
 
-	handler.log("ResponseOutgoing", "status", strconv.Itoa(status), "method", r.Method, "path", r.URL.Path)
+	handler.log("ResponseOutgoing", "status", strconv.Itoa(status), "method", r.Method, "path", r.URL.Path, "requestId", getRequestId(r))
 }
 
 // Make an absolute URLs to the given upload id. If the base path is absolute
@@ -952,39 +1194,27 @@ func (handler *UnroutedHandler) absFileURL(r *http.Request, id string) string {
 	return url
 }
 
-type progressWriter struct {
-	Offset int64
-}
-
-func (w *progressWriter) Write(b []byte) (int, error) {
-	atomic.AddInt64(&w.Offset, int64(len(b)))
-	return len(b), nil
-}
-
 // sendProgressMessage will send a notification over the UploadProgress channel
 // every second, indicating how much data has been transfered to the server.
 // It will stop sending these instances once the returned channel has been
-// closed. The returned reader should be used to read the request body.
-func (handler *UnroutedHandler) sendProgressMessages(hook HookEvent, reader io.Reader) (io.Reader, chan<- struct{}) {
+// closed.
+func (handler *UnroutedHandler) sendProgressMessages(hook HookEvent, reader *bodyReader) chan<- struct{} {
 	previousOffset := int64(0)
-	progress := &progressWriter{
-		Offset: hook.Upload.Offset,
-	}
+	originalOffset := hook.Upload.Offset
 	stop := make(chan struct{}, 1)
-	reader = io.TeeReader(reader, progress)
 
 	go func() {
 		for {
 			select {
 			case <-stop:
-				hook.Upload.Offset = atomic.LoadInt64(&progress.Offset)
+				hook.Upload.Offset = originalOffset + reader.bytesRead()
 				if hook.Upload.Offset != previousOffset {
 					handler.UploadProgress <- hook
 					previousOffset = hook.Upload.Offset
 				}
 				return
 			case <-time.After(1 * time.Second):
-				hook.Upload.Offset = atomic.LoadInt64(&progress.Offset)
+				hook.Upload.Offset = originalOffset + reader.bytesRead()
 				if hook.Upload.Offset != previousOffset {
 					handler.UploadProgress <- hook
 					previousOffset = hook.Upload.Offset
@@ -993,7 +1223,7 @@ func (handler *UnroutedHandler) sendProgressMessages(hook HookEvent, reader io.R
 		}
 	}()
 
-	return reader, stop
+	return stop
 }
 
 // getHostAndProtocol extracts the host and used protocol (either HTTP or HTTPS)
@@ -1103,6 +1333,12 @@ func (handler *UnroutedHandler) lockUpload(id string) (Lock, error) {
 	return lock, nil
 }
 
+// isResumableUploadDraftRequest returns whether a HTTP request includes a sign that it is
+// related to resumable upload draft from IETF (instead of tus v1)
+func (handler UnroutedHandler) isResumableUploadDraftRequest(r *http.Request) bool {
+	return handler.config.EnableExperimentalProtocol && r.Header.Get("Upload-Draft-Interop-Version") == currentUploadDraftInteropVersion
+}
+
 // ParseMetadataHeader parses the Upload-Metadata header as defined in the
 // File Creation extension.
 // e.g. Upload-Metadata: name bHVucmpzLnBuZw==,type aW1hZ2UvcG5n
@@ -1114,19 +1350,27 @@ func ParseMetadataHeader(header string) map[string]string {
 
 		parts := strings.Split(element, " ")
 
-		// Do not continue with this element if no key and value or presented
-		if len(parts) != 2 {
+		if len(parts) > 2 {
 			continue
 		}
 
-		// Ignore corrent element if the value is no valid base64
 		key := parts[0]
-		value, err := base64.StdEncoding.DecodeString(parts[1])
-		if err != nil {
+		if key == "" {
 			continue
 		}
 
-		meta[key] = string(value)
+		value := ""
+		if len(parts) == 2 {
+			// Ignore current element if the value is no valid base64
+			dec, err := base64.StdEncoding.DecodeString(parts[1])
+			if err != nil {
+				continue
+			}
+
+			value = string(dec)
+		}
+
+		meta[key] = value
 	}
 
 	return meta
@@ -1204,4 +1448,21 @@ func extractIDFromPath(url string) (string, error) {
 
 func i64toa(num int64) string {
 	return strconv.FormatInt(num, 10)
+}
+
+// getRequestId returns the value of the X-Request-ID header, if available,
+// and also takes care of truncating the input.
+func getRequestId(r *http.Request) string {
+	reqId := r.Header.Get("X-Request-ID")
+	if reqId == "" {
+		return ""
+	}
+
+	// Limit the length of the request ID to 36 characters, which is enough
+	// to fit a UUID.
+	if len(reqId) > 36 {
+		reqId = reqId[:36]
+	}
+
+	return reqId
 }
